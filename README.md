@@ -46,7 +46,7 @@ A Retrieval-Augmented Generation (RAG) application designed for HVAC mechanics t
 
 ```bash
 # Clone or download the repository
-cd ContextualAI-Capstone
+cd RAG-climate
 
 # Create a virtual environment
 python -m venv venv
