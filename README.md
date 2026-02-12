@@ -1,4 +1,4 @@
-# HVAC RAG Technical Assistant
+# Retrieval Augmented Generation for Climate Challenges
 
 A Retrieval-Augmented Generation (RAG) application designed for HVAC mechanics to search and query technical documentation using AI.
 
