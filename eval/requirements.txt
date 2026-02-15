@@ -1,0 +1,4 @@
+groq>=0.4.1,<1
+ragas>=0.2.0
+langchain-groq>=0.2.0
+datasets>=2.14.0
