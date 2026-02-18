@@ -1,12 +1,16 @@
-"""Groq client and answer generation."""
+"""Groq client and answer generation (with Ollama fallback)."""
 
 import os
+import requests
 from dotenv import load_dotenv
 from groq import Groq
 
 from config import SYSTEM_PROMPT, SYSTEM_MESSAGE, LLM_MODEL, LLM_TEMPERATURE, LLM_MAX_TOKENS, LLM_TOP_P
 
 load_dotenv()
+
+OLLAMA_BASE_URL = "http://localhost:11434"
+OLLAMA_MODEL = "llama3.2:latest"
 
 
 def get_groq_client() -> Groq:
@@ -45,6 +49,33 @@ def generate_answer(query: str, context: str, groq_client: Groq) -> str:
             top_p=LLM_TOP_P,
         )
         return chat_completion.choices[0].message.content
+
+    except Exception as e:
+        return f"Error generating answer: {str(e)}"
+
+
+def generate_answer_ollama(query: str, context: str) -> str:
+    """Send query + context to local Ollama and return the answer."""
+    prompt = SYSTEM_PROMPT.format(context=context, query=query)
+
+    try:
+        response = requests.post(
+            f"{OLLAMA_BASE_URL}/api/generate",
+            json={
+                "model": OLLAMA_MODEL,
+                "prompt": prompt,
+                "system": SYSTEM_MESSAGE,
+                "stream": False,
+                "options": {
+                    "temperature": LLM_TEMPERATURE,
+                    "num_predict": LLM_MAX_TOKENS,
+                    "top_p": LLM_TOP_P,
+                },
+            },
+            timeout=120,
+        )
+        response.raise_for_status()
+        return response.json().get("response", "").strip()
 
     except Exception as e:
         return f"Error generating answer: {str(e)}"

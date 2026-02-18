@@ -1,4 +1,5 @@
 import os
+import time as _time
 from sentence_transformers import SentenceTransformer
 import chromadb
 from rank_bm25 import BM25Okapi
@@ -215,6 +216,70 @@ class HybridRetriever:
         print(f"Returning top {len(final_results)} results")
 
         return final_results
+
+    def hybrid_search_timed(
+        self,
+        query: str,
+        top_k: int = 5,
+        brand_filter: str = None,
+    ) -> Dict:
+        """
+        Same as hybrid_search but returns timing data.
+        Returns: {"results": [...], "timings": {"embed_ms": ..., "search_ms": ..., "rerank_ms": ...}}
+        """
+        if self.bm25 is None or brand_filter:
+            self._load_bm25_index(brand_filter)
+
+        if not self.all_documents:
+            return {"results": [], "timings": {"embed_ms": 0, "search_ms": 0, "rerank_ms": 0}}
+
+        total_start = _time.perf_counter()
+
+        # --- Embed ---
+        embed_start = _time.perf_counter()
+        query_embedding = self.embedding_model.encode(query).tolist()
+        embed_ms = (_time.perf_counter() - embed_start) * 1000
+
+        # --- Vector search (using pre-computed embedding) ---
+        where_filter = None
+        if brand_filter:
+            where_filter = {"filename": {"$contains": brand_filter.lower()}}
+
+        vs_start = _time.perf_counter()
+        vs_results = self.collection.query(
+            query_embeddings=[query_embedding],
+            n_results=20,
+            where=where_filter,
+            include=['documents', 'metadatas', 'distances'],
+        )
+        vector_results = []
+        for i in range(len(vs_results['documents'][0])):
+            vector_results.append({
+                'id': vs_results['ids'][0][i],
+                'document': vs_results['documents'][0][i],
+                'metadata': vs_results['metadatas'][0][i],
+                'score': 1 - vs_results['distances'][0][i],
+                'method': 'vector',
+            })
+
+        # --- BM25 search ---
+        bm25_results = self.bm25_search(query, top_k=20)
+        search_ms = (_time.perf_counter() - vs_start) * 1000
+
+        # --- Rerank (RRF) ---
+        rerank_start = _time.perf_counter()
+        merged_results = self.reciprocal_rank_fusion(vector_results, bm25_results)
+        final_results = merged_results[:top_k]
+        rerank_ms = (_time.perf_counter() - rerank_start) * 1000
+
+        return {
+            "results": final_results,
+            "timings": {
+                "embed_ms": round(embed_ms, 2),
+                "search_ms": round(search_ms, 2),
+                "rerank_ms": round(rerank_ms, 2),
+            },
+        }
 
     def get_available_brands(self) -> List[str]:
         """Get unique brand names from filenames in the collection."""
