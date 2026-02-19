@@ -1,7 +1,5 @@
 """Prompts, model settings, and constants."""
 
-import os
-
 # LLM
 LLM_MODEL = "llama-3.3-70b-versatile"
 LLM_TEMPERATURE = 0.2
@@ -43,8 +41,3 @@ EXAMPLE_QUERIES = [
     "What training is required for RAC technicians?",
     "What is the India Cooling Action Plan?",
 ]
-
-# Eval
-EVAL_LLM_MODEL = LLM_MODEL
-EVAL_TEST_SET_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "eval", "test_set.json")
-EVAL_RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "eval", "results")
