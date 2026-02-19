@@ -41,25 +41,33 @@ OLLAMA_MODEL = "llama3.2:latest"
 
 
 def generate_answer_ollama(query: str, context: str) -> str:
-    """Generate answer using local Ollama."""
+    """Generate answer using local Ollama. Retries once on timeout."""
     prompt = SYSTEM_PROMPT.format(context=context, query=query)
-    response = requests.post(
-        f"{OLLAMA_BASE_URL}/api/generate",
-        json={
-            "model": OLLAMA_MODEL,
-            "prompt": prompt,
-            "system": SYSTEM_MESSAGE,
-            "stream": False,
-            "options": {
-                "temperature": LLM_TEMPERATURE,
-                "num_predict": LLM_MAX_TOKENS,
-                "top_p": LLM_TOP_P,
-            },
+    payload = {
+        "model": OLLAMA_MODEL,
+        "prompt": prompt,
+        "system": SYSTEM_MESSAGE,
+        "stream": False,
+        "options": {
+            "temperature": LLM_TEMPERATURE,
+            "num_predict": LLM_MAX_TOKENS,
+            "top_p": LLM_TOP_P,
         },
-        timeout=120,
-    )
-    response.raise_for_status()
-    return response.json().get("response", "").strip()
+    }
+    for attempt in range(2):
+        try:
+            response = requests.post(
+                f"{OLLAMA_BASE_URL}/api/generate",
+                json=payload,
+                timeout=300,
+            )
+            response.raise_for_status()
+            return response.json().get("response", "").strip()
+        except requests.Timeout:
+            if attempt == 0:
+                print("  Ollama generate timed out, retrying...")
+            else:
+                raise
 
 
 def load_eval_dataset(path: str) -> List[Dict]:
