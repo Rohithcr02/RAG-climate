@@ -1,13 +1,11 @@
-"""
-Retrieval metrics computed at multiple k cutoffs: Recall@k, MRR@k, NDCG@k.
-"""
+"""Retrieval quality metrics: recall@k, MRR@k, NDCG@k."""
 
 import math
 from typing import List, Dict
 
 
 def recall_at_k(retrieved_filenames: List[str], gold_sources: List[str], k: int) -> float:
-    """Fraction of gold sources found in the top-k retrieved documents."""
+    """Fraction of gold sources found in the top-k retrieved filenames."""
     top_k = retrieved_filenames[:k]
     if not gold_sources:
         return 0.0
@@ -16,7 +14,7 @@ def recall_at_k(retrieved_filenames: List[str], gold_sources: List[str], k: int)
 
 
 def mrr_at_k(retrieved_filenames: List[str], gold_sources: List[str], k: int) -> float:
-    """Reciprocal rank of first gold-source hit within top-k."""
+    """Reciprocal rank of the first gold source in the top-k."""
     for i, fn in enumerate(retrieved_filenames[:k], 1):
         if fn in gold_sources:
             return 1.0 / i
@@ -25,8 +23,7 @@ def mrr_at_k(retrieved_filenames: List[str], gold_sources: List[str], k: int) ->
 
 def ndcg_at_k(retrieved_filenames: List[str], gold_sources: List[str], k: int) -> float:
     """
-    NDCG@k — binary relevance (1 if from gold source, 0 otherwise).
-    Each gold source is only counted as relevant ONCE (first occurrence).
+    NDCG@k with binary relevance. Each gold source counted once (dedup).
     DCG  = sum( rel_i / log2(i+1) ) for i=1..k
     IDCG = sum( 1 / log2(i+1) )     for i=1..min(k, num_gold)
     """
@@ -54,7 +51,7 @@ def compute_retrieval_metrics_at_k(
     gold_sources: List[str],
     k_values: List[int] = [1, 3, 5],
 ) -> Dict[str, float]:
-    """Compute recall, MRR, NDCG at each k. Returns flat dict like {'recall@1': ..., 'mrr@3': ...}."""
+    """Compute recall, MRR, and NDCG at each k value."""
     metrics = {}
     for k in k_values:
         metrics[f"recall@{k}"] = round(recall_at_k(retrieved_filenames, gold_sources, k), 4)

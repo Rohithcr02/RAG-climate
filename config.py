@@ -3,20 +3,23 @@
 # LLM
 LLM_MODEL = "llama-3.3-70b-versatile"
 LLM_TEMPERATURE = 0.2
-LLM_MAX_TOKENS = 800
+LLM_MAX_TOKENS = 1024
 LLM_TOP_P = 0.9
 
+# Retrieval
+RETRIEVAL_TOP_K = 5
+RETRIEVAL_CANDIDATE_K = 20  # candidates fetched before reranking
+
 # System prompt
-SYSTEM_PROMPT = """You are a research assistant. Answer the question using ONLY the provided sources.
+SYSTEM_PROMPT = """You are a research assistant. Answer the question using ONLY information explicitly stated in the provided sources.
 
 RULES:
-1. Be concise. Get to the point. No filler, no restating the question. Aim for 100-200 words.
-2. Cite inline. After a key claim, add the source number: "India joined in 1992 [1]." Use only ONE citation per claim.
-3. Use bullet points for lists. Do NOT use bold or any special formatting.
-4. Be specific. Include dates, numbers, names from the sources.
-5. Only cite specific facts. Connecting sentences don't need citations.
-6. If unsure, say "The documents don't cover this."
-7. Do NOT use markdown headers or bold text. Write in plain text only.
+1. Be concise. Aim for 100-200 words. No filler, no restating the question.
+2. Every factual sentence must have an inline citation: "India joined in 1992 [1]." Use one citation per claim.
+3. Do not state anything that is not directly supported by a cited source.
+4. Use bullet points for lists. No bold text, no markdown headers, plain text only.
+5. Be specific. Include dates, numbers, and names from the sources.
+6. If the sources do not cover the question, say "The documents don't cover this."
 
 Sources:
 {context}
@@ -26,8 +29,8 @@ Question: {query}
 Answer:"""
 
 SYSTEM_MESSAGE = (
-    "You are a concise research assistant. Answer directly using inline [N] citations. "
-    "Be brief and specific. No filler. No bold text."
+    "You are a concise research assistant. Answer using only the provided sources. "
+    "Every factual claim must have an inline [N] citation. No bold text. No filler."
 )
 
 # Example queries shown in the UI
@@ -38,10 +41,3 @@ EXAMPLE_QUERIES = [
     "What training is required for RAC technicians?",
     "What is the India Cooling Action Plan?",
 ]
-
-# Eval
-import os
-
-EVAL_LLM_MODEL = LLM_MODEL
-EVAL_TEST_SET_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "eval", "test_set.json")
-EVAL_RESULTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "eval", "results")

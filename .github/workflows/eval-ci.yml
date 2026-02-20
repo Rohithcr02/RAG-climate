@@ -1,0 +1,88 @@
+name: RAG Eval Pipeline
+
+on:
+  push:
+    branches-ignore:
+      - main
+
+jobs:
+  eval:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      # ---- Checkout ----
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ---- Python ----
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # ---- Ollama ----
+      - name: Install Ollama
+        run: |
+          curl -fsSL https://ollama.com/install.sh | sh
+
+      - name: Start Ollama and pull model
+        run: |
+          ollama serve &
+          sleep 5
+          ollama pull llama3.2:latest
+          echo "Ollama ready"
+
+      # ---- Run Eval ----
+      - name: Run comprehensive evaluation
+        env:
+          CHROMA_COLLECTION_NAME: hvac_documents
+          TOKENIZERS_PARALLELISM: "false"
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python run_contextual_eval.py \
+            --output eval_results_comprehensive.json \
+            2>&1 | tee eval_output.log
+          echo "Eval complete"
+
+      # ---- Upload artifacts ----
+      - name: Upload eval results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: eval-results-${{ github.ref_name }}
+          path: |
+            eval_results_comprehensive.json
+            eval_output.log
+          retention-days: 30
+
+      # ---- Format + Send Email ----
+      - name: Format email report
+        if: always() && hashFiles('eval_results_comprehensive.json') != ''
+        run: |
+          python format_email.py \
+            --input eval_results_comprehensive.json \
+            --branch "${{ github.ref_name }}" \
+            --commit "${{ github.sha }}" \
+            --repo "${{ github.repository }}" \
+            > email_body.html
+
+      - name: Send email to collaborators
+        if: always() && hashFiles('email_body.html') != ''
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "RAG Eval Results — ${{ github.ref_name }} @ ${{ github.sha }}"
+          to: asaikiranb@gmail.com, balaji24@uw.edu, mithul24@uw.edu, rohith02@uw.edu, sagorika@uw.edu, annangi@uw.edu
+          from: "RAG Eval Bot <${{ secrets.SMTP_USERNAME }}>"
+          html_body: file://email_body.html
+          attachments: eval_results_comprehensive.json

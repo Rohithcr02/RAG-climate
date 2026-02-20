@@ -1,38 +1,75 @@
 """
-Evaluate the RAG pipeline using contextual_eval_dataset.jsonl.
+Comprehensive RAG evaluation with cross-encoder reranking.
 
-For each question:
-  1. Run hybrid search to retrieve top-k chunks (with timing)
-  2. Compute retrieval metrics: recall@k, MRR@k, NDCG@k for k=1,3,5
-  3. Generate an answer via Groq LLM (with timing)
-  4. Score generation quality: faithfulness, relevance, completeness (LLM-judged)
-  5. Score citation quality: validity, coverage, source grounding
-  6. Report all results with latency percentile stats
+Metrics computed:
+  - Retrieval: recall@k, MRR@k, NDCG@k for k=1,3,5
+  - Generation: faithfulness, relevance, completeness (LLM-judged via Ollama)
+  - Citation: validity, coverage, source grounding
+  - Latency: embed_ms, search_ms, rerank_ms, generate_ms (mean/p50/p95/min/max)
+  - Breakdown by difficulty (Easy/Medium/Hard)
 
 Usage:
-    python run_contextual_eval.py                        # full run
-    python run_contextual_eval.py --retrieval-only        # skip LLM, just test retrieval
-    python run_contextual_eval.py --top-k 10              # retrieve more chunks
-    python run_contextual_eval.py --output results.json   # custom output path
+    python run_contextual_eval.py                        # full run with reranker
+    python run_contextual_eval.py --no-reranker          # skip cross-encoder
+    python run_contextual_eval.py --retrieval-only       # skip LLM, just test retrieval
+    python run_contextual_eval.py --output results.json  # custom output path
 """
 
-import json
 import os
 import sys
+
+# When HF_TOKEN is not set, force HuggingFace libs to use the local cache only.
+# Without this, AutoTokenizer / AutoConfig calls to HF Hub can hang indefinitely
+# on unauthenticated rate limits (silent infinite stall, not a fast failure).
+# CI always sets HF_TOKEN, so it stays in online mode and can download models fresh.
+if not os.environ.get("HF_TOKEN"):
+    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+    os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+
+import json
 import argparse
 import time
+import requests
 import numpy as np
 from datetime import datetime
 from typing import List, Dict
 
 from retrieve import HybridRetriever
-from llm import build_context, generate_answer_ollama
+from rerank import load_reranker
+from llm import build_context
+from config import SYSTEM_PROMPT, SYSTEM_MESSAGE, LLM_TEMPERATURE, LLM_MAX_TOKENS, LLM_TOP_P
 from eval.metrics import citation_validity, citation_coverage, source_grounding
 from eval.retrieval_metrics import compute_retrieval_metrics_at_k
 from eval.generation_metrics import judge_generation
 
 
 K_VALUES = [1, 3, 5]
+
+OLLAMA_BASE_URL = "http://localhost:11434"
+OLLAMA_MODEL = "llama3.2:latest"
+
+
+def generate_answer_ollama(query: str, context: str) -> str:
+    """Generate answer using local Ollama."""
+    prompt = SYSTEM_PROMPT.format(context=context, query=query)
+    response = requests.post(
+        f"{OLLAMA_BASE_URL}/api/generate",
+        json={
+            "model": OLLAMA_MODEL,
+            "prompt": prompt,
+            "system": SYSTEM_MESSAGE,
+            "stream": False,
+            "options": {
+                "temperature": LLM_TEMPERATURE,
+                "num_predict": LLM_MAX_TOKENS,
+                "top_p": LLM_TOP_P,
+            },
+        },
+        timeout=120,
+    )
+    response.raise_for_status()
+    return response.json().get("response", "").strip()
 
 
 def load_eval_dataset(path: str) -> List[Dict]:
@@ -49,7 +86,7 @@ def load_eval_dataset(path: str) -> List[Dict]:
 def percentile_stats(values: List[float]) -> Dict:
     """Compute mean, p50, p95, min, max for a list of values."""
     if not values:
-        return {"mean": 0.0, "p50": 0.0, "p95": 0.0, "min": 0.0, "max": 0.0}
+        return {"mean": 0, "p50": 0, "p95": 0, "min": 0, "max": 0}
     arr = np.array(values)
     return {
         "mean": round(float(np.mean(arr)), 2),
@@ -60,65 +97,129 @@ def percentile_stats(values: List[float]) -> Dict:
     }
 
 
+def _write_results(
+    output_path, results_log, all_retrieval_metrics, all_generation_metrics,
+    citation_scores, latency_embed, latency_search, latency_rerank,
+    latency_generate, difficulty_buckets, top_k, retrieval_only,
+    use_reranker, total, partial=False,
+):
+    """Write current results to disk. Called after every question (partial=True) and at the end."""
+    if not all_retrieval_metrics:
+        return
+
+    agg_retrieval = {}
+    for k in K_VALUES:
+        for metric in ["recall", "mrr", "ndcg"]:
+            key = f"{metric}@{k}"
+            vals = [m[key] for m in all_retrieval_metrics]
+            agg_retrieval[key] = round(float(np.mean(vals)), 4)
+
+    agg_generation = {}
+    if all_generation_metrics:
+        for key in ["faithfulness", "relevance", "completeness", "overall"]:
+            vals = [m[key] for m in all_generation_metrics]
+            agg_generation[key] = round(float(np.mean(vals)), 4)
+
+    agg_citation = {}
+    if citation_scores["validity"]:
+        for key in ["validity", "coverage", "grounding"]:
+            agg_citation[f"citation_{key}"] = round(float(np.mean(citation_scores[key])), 4)
+
+    latency_summary = {}
+    for name, values in [
+        ("embed_ms", latency_embed), ("search_ms", latency_search),
+        ("rerank_ms", latency_rerank), ("generate_ms", latency_generate),
+    ]:
+        latency_summary[name] = percentile_stats(values)
+
+    difficulty_summary = {}
+    for diff, data in sorted(difficulty_buckets.items()):
+        n = data["count"]
+        r5 = round(float(np.mean([m["recall@5"] for m in data["retrieval"]])), 4)
+        mrr5 = round(float(np.mean([m["mrr@5"] for m in data["retrieval"]])), 4)
+        ndcg5 = round(float(np.mean([m["ndcg@5"] for m in data["retrieval"]])), 4)
+        faith = round(float(np.mean([m["faithfulness"] for m in data["generation"]])), 4) if data["generation"] else 0.0
+        difficulty_summary[diff] = {"count": n, "recall@5": r5, "mrr@5": mrr5, "ndcg@5": ndcg5, "faithfulness": faith}
+
+    output = {
+        "timestamp": datetime.now().isoformat(),
+        "partial": partial,
+        "questions_completed": len(results_log),
+        "config": {
+            "top_k": top_k,
+            "retrieval_only": retrieval_only,
+            "reranker": "cross-encoder/ms-marco-MiniLM-L-6-v2" if use_reranker else "none",
+            "answer_model": "ollama/llama3.2",
+            "judge_model": "ollama/llama3.2",
+            "total_questions": total,
+        },
+        "retrieval_metrics": agg_retrieval,
+        "generation_metrics": agg_generation,
+        "citation_metrics": agg_citation,
+        "latency_summary": latency_summary,
+        "difficulty_breakdown": difficulty_summary,
+        "per_question": results_log,
+    }
+
+    with open(output_path, "w") as f:
+        json.dump(output, f, indent=2)
+
+
 def run_eval(
     dataset_path: str,
-    retrieval_only: bool = False,
+    output_path: str,
     top_k: int = 5,
-    output_path: str = None,
+    retrieval_only: bool = False,
+    use_reranker: bool = True,
 ):
-    """Run the full evaluation."""
-    print("=" * 70)
-    print("  RAG Contextual Evaluation — Comprehensive Metrics")
-    print("=" * 70)
-
-    # Load dataset
     dataset = load_eval_dataset(dataset_path)
-    print(f"\nLoaded {len(dataset)} questions from {dataset_path}")
+    total = len(dataset)
+    print(f"\nLoaded {total} questions from {os.path.basename(dataset_path)}")
 
-    # Init retriever
     print("Loading retriever...")
     retriever = HybridRetriever()
 
-    # Init LLM
+    # Load cross-encoder reranker
+    reranker = None
+    if use_reranker:
+        print("Loading cross-encoder reranker...")
+        reranker = load_reranker()
+        print("Reranker ready (ms-marco-MiniLM-L-6-v2)")
+    else:
+        print("Reranker disabled")
+
+    # LLM
     if not retrieval_only:
         print("Using local Ollama (llama3.2) for answer generation + scoring")
 
     # Accumulators
     results_log = []
-    all_retrieval_metrics = []  # per-question dicts
-    all_generation_metrics = []  # per-question dicts
-    latency_embed = []
-    latency_search = []
-    latency_rerank = []
-    latency_generate = []
-
+    all_retrieval_metrics = []
+    all_generation_metrics = []
     citation_scores = {"validity": [], "coverage": [], "grounding": []}
+    latency_embed, latency_search, latency_rerank, latency_generate = [], [], [], []
     difficulty_buckets = {}
 
-    for i, entry in enumerate(dataset, 1):
+    for idx, entry in enumerate(dataset):
         question = entry["question"]
-        gold_sources = entry["gold_sources"]
-        difficulty = entry.get("metadata", {}).get("difficulty", "Unknown")
+        gold_sources = entry.get("gold_sources", [])
+        difficulty = entry.get("metadata", {}).get("difficulty", "unknown")
+        q_short = question[:80] + "..." if len(question) > 80 else question
+        print(f"\n[{idx + 1}/{total}] ({difficulty}) {q_short}")
 
-        print(f"\n[{i}/{len(dataset)}] ({difficulty}) {question[:80]}...")
+        # ---------- Retrieval with timing ----------
+        retrieval_data = retriever.hybrid_search_timed(
+            query=question, top_k=top_k, reranker=reranker
+        )
+        search_results = retrieval_data["results"]
+        timings = retrieval_data["timings"]
 
-        # ---------- Retrieve with timing ----------
-        try:
-            search_data = retriever.hybrid_search_timed(
-                query=question, top_k=top_k, brand_filter=None
-            )
-            search_results = search_data["results"]
-            timings = search_data["timings"]
+        latency_embed.append(timings["embed_ms"])
+        latency_search.append(timings["search_ms"])
+        latency_rerank.append(timings["rerank_ms"])
 
-            latency_embed.append(timings["embed_ms"])
-            latency_search.append(timings["search_ms"])
-            latency_rerank.append(timings["rerank_ms"])
-        except Exception as e:
-            print(f"  ✗ Search error: {e}")
-            continue
-
-        # ---------- Retrieval metrics at k=1,3,5 ----------
         retrieved_filenames = [r["metadata"]["filename"] for r in search_results]
+
         ret_metrics = compute_retrieval_metrics_at_k(
             retrieved_filenames, gold_sources, k_values=K_VALUES
         )
@@ -143,7 +244,7 @@ def run_eval(
             try:
                 context = build_context(search_results)
 
-                # Generate answer via local Ollama
+                # Generate answer via Ollama
                 gen_start = time.perf_counter()
                 answer = generate_answer_ollama(question, context)
                 gen_ms = (time.perf_counter() - gen_start) * 1000
@@ -158,11 +259,9 @@ def run_eval(
                 citation_scores["coverage"].append(cc["score"])
                 citation_scores["grounding"].append(sg["score"])
 
-                # LLM-judged generation quality (via local Ollama)
+                # LLM-judged generation quality (via Ollama)
                 gen_metrics = judge_generation(
-                    question=question,
-                    context=context,
-                    answer=answer,
+                    question=question, context=context, answer=answer,
                 )
                 all_generation_metrics.append(gen_metrics)
 
@@ -176,182 +275,99 @@ def run_eval(
                 result_entry["generation_metrics"] = gen_metrics
                 result_entry["generate_ms"] = round(gen_ms, 2)
 
-                # Brief pause between questions
-                time.sleep(0.5)
-
             except Exception as e:
-                print(f"  ✗ LLM error: {e}")
-                time.sleep(0.5)
+                print(f"  LLM error: {e}")
 
         # Track by difficulty
         if difficulty not in difficulty_buckets:
-            difficulty_buckets[difficulty] = {"retrieval": [], "generation": []}
+            difficulty_buckets[difficulty] = {
+                "retrieval": [], "generation": [], "count": 0,
+            }
         difficulty_buckets[difficulty]["retrieval"].append(ret_metrics)
         if gen_metrics:
             difficulty_buckets[difficulty]["generation"].append(gen_metrics)
+        difficulty_buckets[difficulty]["count"] += 1
 
         results_log.append(result_entry)
 
-    # ================================================================
-    # AGGREGATE
-    # ================================================================
-    def avg(lst):
-        return round(sum(lst) / len(lst), 4) if lst else 0.0
+        # Checkpoint: flush partial results after every question so a timeout
+        # doesn't lose everything. The final save at the end overwrites this.
+        _write_results(
+            output_path, results_log, all_retrieval_metrics, all_generation_metrics,
+            citation_scores, latency_embed, latency_search, latency_rerank,
+            latency_generate, difficulty_buckets, top_k, retrieval_only,
+            use_reranker, total, partial=True,
+        )
 
-    def avg_metric(metric_dicts, key):
-        vals = [d[key] for d in metric_dicts if key in d]
-        return round(sum(vals) / len(vals), 4) if vals else 0.0
+    # ==================== Final save + print ====================
+    _write_results(
+        output_path, results_log, all_retrieval_metrics, all_generation_metrics,
+        citation_scores, latency_embed, latency_search, latency_rerank,
+        latency_generate, difficulty_buckets, top_k, retrieval_only,
+        use_reranker, total, partial=False,
+    )
 
-    # Retrieval metrics aggregate
-    retrieval_agg = {}
-    for k in K_VALUES:
-        for metric_name in ["recall", "mrr", "ndcg"]:
-            key = f"{metric_name}@{k}"
-            retrieval_agg[key] = avg_metric(all_retrieval_metrics, key)
+    # Read back the saved file for console summary
+    with open(output_path) as f:
+        saved = json.load(f)
 
-    # Generation metrics aggregate
-    generation_agg = {}
-    if all_generation_metrics:
-        for key in ["faithfulness", "relevance", "completeness", "overall"]:
-            generation_agg[key] = avg_metric(all_generation_metrics, key)
-
-    # Latency summary
-    latency_summary = {
-        "embed_ms": percentile_stats(latency_embed),
-        "search_ms": percentile_stats(latency_search),
-        "rerank_ms": percentile_stats(latency_rerank),
-        "generate_ms": percentile_stats(latency_generate),
-    }
-
-    # By difficulty
-    by_difficulty = {}
-    for diff in ["Easy", "Medium", "Hard", "Unknown"]:
-        if diff not in difficulty_buckets:
-            continue
-        bucket = difficulty_buckets[diff]
-        diff_ret = {}
-        for k in K_VALUES:
-            for metric_name in ["recall", "mrr", "ndcg"]:
-                key = f"{metric_name}@{k}"
-                diff_ret[key] = avg_metric(bucket["retrieval"], key)
-        diff_gen = {}
-        if bucket["generation"]:
-            for key in ["faithfulness", "relevance", "completeness", "overall"]:
-                diff_gen[key] = avg_metric(bucket["generation"], key)
-        by_difficulty[diff] = {
-            "count": len(bucket["retrieval"]),
-            "retrieval_metrics": diff_ret,
-            "generation_metrics": diff_gen,
-        }
-
-    # ================================================================
-    # BUILD SUMMARY
-    # ================================================================
-    summary = {
-        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "total_questions": len(dataset),
-        "evaluated": len(results_log),
-        "top_k": top_k,
-        "retrieval_only": retrieval_only,
-        "k_values": K_VALUES,
-        "retrieval_metrics": retrieval_agg,
-        "generation_metrics": generation_agg,
-        "citation_metrics": {
-            "citation_validity": avg(citation_scores["validity"]),
-            "citation_coverage": avg(citation_scores["coverage"]),
-            "source_grounding": avg(citation_scores["grounding"]),
-        } if citation_scores["validity"] else {},
-        "latency_summary": latency_summary,
-        "by_difficulty": by_difficulty,
-    }
-
-    # ================================================================
-    # PRINT SUMMARY
-    # ================================================================
     print("\n" + "=" * 70)
     print("  RESULTS")
     print("=" * 70)
-
-    print(f"\n  Questions evaluated: {summary['evaluated']}/{summary['total_questions']}")
+    print(f"\n  Questions evaluated: {saved['questions_completed']}/{total}")
     print(f"  Top-K: {top_k}")
+    print(f"  Reranker: {'cross-encoder/ms-marco-MiniLM-L-6-v2' if use_reranker else 'disabled'}")
 
-    print(f"\n  RETRIEVAL METRICS:")
+    print("\n  RETRIEVAL METRICS:")
     for k in K_VALUES:
-        r = retrieval_agg[f"recall@{k}"]
-        m = retrieval_agg[f"mrr@{k}"]
-        n = retrieval_agg[f"ndcg@{k}"]
-        print(f"    k={k}:  recall={r:.4f}  mrr={m:.4f}  ndcg={n:.4f}")
+        r = saved["retrieval_metrics"]
+        print(f"    k={k}:  recall={r[f'recall@{k}']:.4f}  mrr={r[f'mrr@{k}']:.4f}  ndcg={r[f'ndcg@{k}']:.4f}")
 
-    if generation_agg:
-        print(f"\n  GENERATION METRICS:")
-        for key, val in generation_agg.items():
-            print(f"    {key:15s} {val:.4f}")
+    if saved["generation_metrics"]:
+        print("\n  GENERATION METRICS:")
+        for key, val in saved["generation_metrics"].items():
+            print(f"    {key:20s}{val:.4f}")
+    else:
+        print("\n  GENERATION METRICS: (skipped)")
 
-    if citation_scores["validity"]:
-        print(f"\n  CITATION METRICS:")
-        print(f"    citation_validity: {avg(citation_scores['validity']):.4f}")
-        print(f"    citation_coverage: {avg(citation_scores['coverage']):.4f}")
-        print(f"    source_grounding:  {avg(citation_scores['grounding']):.4f}")
+    if saved["citation_metrics"]:
+        print("\n  CITATION METRICS:")
+        for key, val in saved["citation_metrics"].items():
+            print(f"    {key}: {val:.4f}")
+    else:
+        print("\n  CITATION METRICS: (skipped)")
 
-    print(f"\n  LATENCY SUMMARY:")
-    for stage, stats in latency_summary.items():
-        print(f"    {stage:15s}  mean={stats['mean']:7.1f}ms  p50={stats['p50']:7.1f}ms  p95={stats['p95']:7.1f}ms  min={stats['min']:7.1f}ms  max={stats['max']:7.1f}ms")
+    print("\n  LATENCY SUMMARY:")
+    for name, stats in saved["latency_summary"].items():
+        print(f"    {name:20s}mean={stats['mean']:8.1f}ms  p50={stats['p50']:8.1f}ms  p95={stats['p95']:8.1f}ms  min={stats['min']:8.1f}ms  max={stats['max']:8.1f}ms")
 
-    print(f"\n  BY DIFFICULTY:")
-    for diff in ["Easy", "Medium", "Hard", "Unknown"]:
-        if diff in by_difficulty:
-            b = by_difficulty[diff]
-            r5 = b["retrieval_metrics"].get("recall@5", 0)
-            m5 = b["retrieval_metrics"].get("mrr@5", 0)
-            n5 = b["retrieval_metrics"].get("ndcg@5", 0)
-            print(f"    {diff:<10} n={b['count']:>3}  recall@5={r5:.4f}  mrr@5={m5:.4f}  ndcg@5={n5:.4f}", end="")
-            if b["generation_metrics"]:
-                f_score = b["generation_metrics"].get("faithfulness", 0)
-                print(f"  faith={f_score:.4f}", end="")
-            print()
+    print("\n  BY DIFFICULTY:")
+    for diff, data in sorted(saved["difficulty_breakdown"].items()):
+        print(f"    {diff:10s} n={data['count']:3d}  recall@5={data['recall@5']:.4f}  mrr@5={data['mrr@5']:.4f}  ndcg@5={data['ndcg@5']:.4f}  faith={data['faithfulness']:.4f}")
 
     print("\n" + "=" * 70)
-
-    # ================================================================
-    # SAVE
-    # ================================================================
-    output = {
-        "summary": summary,
-        "per_question": results_log,
-    }
-
-    if output_path is None:
-        output_path = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)),
-            f"eval_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-        )
-
-    with open(output_path, "w") as f:
-        json.dump(output, f, indent=2, default=str)
-
     print(f"\n  Results saved to: {output_path}")
-    return summary
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run RAG eval from contextual dataset")
-    parser.add_argument(
-        "--dataset",
-        default="contextual_eval_dataset.jsonl",
-        help="Path to the JSONL eval dataset",
-    )
-    parser.add_argument(
-        "--retrieval-only",
-        action="store_true",
-        help="Only evaluate retrieval, skip LLM answer generation",
-    )
-    parser.add_argument("--top-k", type=int, default=5, help="Number of chunks to retrieve")
-    parser.add_argument("--output", default=None, help="Output JSON path")
-
+    parser = argparse.ArgumentParser(description="Run comprehensive RAG evaluation")
+    parser.add_argument("--dataset", default="contextual_eval_dataset.jsonl")
+    parser.add_argument("--output", default="eval_results_comprehensive.json")
+    parser.add_argument("--top-k", type=int, default=5)
+    parser.add_argument("--retrieval-only", action="store_true")
+    parser.add_argument("--no-reranker", action="store_true", help="Disable cross-encoder reranking")
     args = parser.parse_args()
+
+    print("=" * 70)
+    print("  RAG Contextual Evaluation — Comprehensive Metrics")
+    if not args.no_reranker:
+        print("  (with cross-encoder reranking)")
+    print("=" * 70)
+
     run_eval(
         dataset_path=args.dataset,
-        retrieval_only=args.retrieval_only,
-        top_k=args.top_k,
         output_path=args.output,
+        top_k=args.top_k,
+        retrieval_only=args.retrieval_only,
+        use_reranker=not args.no_reranker,
     )

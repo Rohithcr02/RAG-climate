@@ -41,6 +41,10 @@ wheels/
 data/
 Saikiran corpus/
 hvac-rag/
+Eval Dataset/
+
+# Local eval result snapshots
+eval_results_*.json
 
 # Logs
 *.log

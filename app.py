@@ -2,9 +2,11 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 from retrieve import HybridRetriever
+from rerank import load_reranker, rerank
 from llm import get_groq_client, build_context, generate_answer
 from html_renderer import build_answer_html
-from config import EXAMPLE_QUERIES
+from query import expand_query
+from config import EXAMPLE_QUERIES, RETRIEVAL_TOP_K
 import voice
 
 st.set_page_config(
@@ -61,6 +63,11 @@ st.markdown("""
 @st.cache_resource
 def load_retriever():
     return HybridRetriever()
+
+
+@st.cache_resource
+def load_reranker_model():
+    return load_reranker()
 
 
 @st.cache_resource
@@ -142,11 +149,26 @@ def _render_voice_recorder(whisper_model):
     return query
 
 
-def _render_answer(query, retriever, groq_client):
-    """Run retrieval and generation, then render the answer."""
+def _retrieve(query: str, retriever: HybridRetriever, groq_client, reranker) -> list:
+    """Expand query, run hybrid search on all variants, rerank merged pool, return top results."""
+    queries = expand_query(query, groq_client)
+
+    seen_ids = set()
+    candidates = []
+    for q in queries:
+        for result in retriever.hybrid_search(q, reranker=reranker):
+            if result["id"] not in seen_ids:
+                seen_ids.add(result["id"])
+                candidates.append(result)
+
+    return rerank(query, candidates, reranker)[:RETRIEVAL_TOP_K]
+
+
+def _render_answer(query: str, retriever: HybridRetriever, groq_client, reranker):
+    """Run the full pipeline and render the answer with source cards."""
     with st.spinner("Searching..."):
         try:
-            results = retriever.hybrid_search(query=query, top_k=5, brand_filter=None)
+            results = _retrieve(query, retriever, groq_client, reranker)
         except Exception as e:
             st.error(f"Search error: {str(e)}")
             st.stop()
@@ -194,7 +216,12 @@ def main():
         st.error(f"Error connecting to ChromaDB: {str(e)}")
         st.stop()
 
-    with st.spinner("Loading voice model..."):
+    with st.spinner("Loading models..."):
+        try:
+            reranker = load_reranker_model()
+        except Exception:
+            reranker = None
+
         try:
             whisper_model = load_whisper_model()
         except Exception:
@@ -208,7 +235,7 @@ def main():
         query = ""
 
     if query:
-        _render_answer(query, retriever, groq_client)
+        _render_answer(query, retriever, groq_client, reranker)
     else:
         _render_example_queries()
 
