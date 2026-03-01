@@ -2,3 +2,4 @@ python-telegram-bot>=21.0.0
 requests>=2.32.0
 python-dotenv>=1.0.0
 gTTS>=2.5.0
+deep-translator>=1.11.0

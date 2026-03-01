@@ -9,6 +9,7 @@ import tempfile
 
 import requests
 from gtts import gTTS
+from deep_translator import GoogleTranslator
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction, ParseMode
@@ -245,13 +246,29 @@ async def language_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     )
 
 
+def translate_text(text: str, target_lang: str) -> str:
+    """Translate text to the target language using Google Translate. Skip if English."""
+    if target_lang == "en":
+        return text
+    try:
+        translated = GoogleTranslator(source="auto", target=target_lang).translate(text)
+        return translated or text
+    except Exception as e:
+        logger.warning(f"Translation failed ({target_lang}): {e}")
+        return text  # fall back to English audio
+
+
 def generate_voice(text: str, lang: str) -> io.BytesIO:
-    """Convert plain text to MP3 bytes using gTTS."""
-    # Strip HTML tags for clean TTS input
+    """Translate text to target language, then convert to MP3 using gTTS."""
+    # Strip HTML tags and citation markers for clean input
     clean = re.sub(r"<[^>]+>", "", text)
-    clean = re.sub(r"\[(\d+)\]", "", clean)   # remove citation markers
-    clean = clean.strip()
-    tts = gTTS(text=clean, lang=lang, slow=False)
+    clean = re.sub(r"\[(\d+)\]", "", clean).strip()
+
+    # Step 1: translate to target language
+    translated = translate_text(clean, lang)
+
+    # Step 2: speak the translated text
+    tts = gTTS(text=translated, lang=lang, slow=False)
     buf = io.BytesIO()
     tts.write_to_fp(buf)
     buf.seek(0)
