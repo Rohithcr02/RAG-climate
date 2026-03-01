@@ -6,6 +6,7 @@ import os
 import re
 import html
 import tempfile
+import time
 
 import requests
 from gtts import gTTS
@@ -330,7 +331,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     chat_id = update.effective_chat.id
-    logger.info(f"Query from {update.effective_user.id}: {question!r}")
+    user_id = update.effective_user.id
+    t_total_start = time.perf_counter()
+    logger.info(f"Query from {user_id}: {question!r}")
 
     status_msg = await update.message.reply_text(
         "🔍 <i>Searching documents…</i>",
@@ -343,7 +346,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             "⚙️ <i>Generating answer…</i>",
             parse_mode=ParseMode.HTML,
         )
+
+        # ── Contextual AI latency ──────────────────────────────────────────────
+        t_api_start = time.perf_counter()
         data = query_contextual_agent(question)
+        t_api_end = time.perf_counter()
+        api_latency = t_api_end - t_api_start
 
         reply = format_response(data)
         await status_msg.delete()
@@ -351,11 +359,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         for chunk in split_message(reply):
             await update.message.reply_text(chunk, parse_mode=ParseMode.HTML)
 
-        # ── TTS: send voice MP3 ──────────────────────────────────────────────
+        # ── TTS latency ────────────────────────────────────────────────────────
         lang = user_prefs.get(chat_id, {}).get("lang", "en")
+        tts_latency = 0.0
         try:
             await update.message.chat.send_action(ChatAction.UPLOAD_VOICE)
+            t_tts_start = time.perf_counter()
             voice_buf = generate_voice(reply, lang)
+            t_tts_end = time.perf_counter()
+            tts_latency = t_tts_end - t_tts_start
             lang_name = INDIAN_LANGUAGES.get(lang, lang)
             await update.message.reply_audio(
                 audio=voice_buf,
@@ -369,6 +381,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 f"🔇 <i>Voice generation failed: {escape_html(str(tts_err))}</i>",
                 parse_mode=ParseMode.HTML,
             )
+
+        # ── Log all latencies ────────────────────────────────────────────────────
+        t_total_end = time.perf_counter()
+        total_latency = t_total_end - t_total_start
+        logger.info(
+            f"[LATENCY] user={user_id} | "
+            f"contextual_api={api_latency:.2f}s | "
+            f"tts={tts_latency:.2f}s | "
+            f"total={total_latency:.2f}s"
+        )
+
+        # Send latency summary to user
+        await update.message.reply_text(
+            f"⏱ <b>Response times:</b> "
+            f"AI: <code>{api_latency:.1f}s</code> | "
+            f"Voice: <code>{tts_latency:.1f}s</code> | "
+            f"Total: <code>{total_latency:.1f}s</code>",
+            parse_mode=ParseMode.HTML,
+        )
 
     except requests.HTTPError as e:
         logger.error(f"Contextual AI API error: {e}")
