@@ -1,16 +1,20 @@
 """Telegram bot powered by Contextual AI agent (replaces local RAG pipeline)."""
 
+import io
 import logging
 import os
 import re
 import html
+import tempfile
 
 import requests
+from gtts import gTTS
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction, ParseMode
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -18,6 +22,23 @@ from telegram.ext import (
 )
 
 load_dotenv()
+
+# ── Indian language options for TTS ──────────────────────────────────────────
+INDIAN_LANGUAGES = {
+    "hi": "🇮🇳 Hindi",
+    "ta": "Tamil",
+    "te": "Telugu",
+    "kn": "Kannada",
+    "ml": "Malayalam",
+    "bn": "Bengali",
+    "mr": "Marathi",
+    "gu": "Gujarati",
+    "pa": "Punjabi",
+    "en": "🌐 English",
+}
+
+# Per-user preferences: {chat_id: {"lang": "hi", "tts": True}}
+user_prefs: dict[int, dict] = {}
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -158,17 +179,85 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "<b>ℹ️ Commands</b>\n\n"
-        "/start   – Welcome message\n"
-        "/help    – This help message\n"
-        "/sources – Show connected data sources\n\n"
+        "/start    – Welcome message\n"
+        "/help     – This help message\n"
+        "/sources  – Show connected data sources\n"
+        "/language – Choose voice language for audio replies\n\n"
         "<b>How it works</b>\n"
         "1. You type a question\n"
         "2. The AI searches across climate &amp; HVAC documents\n"
-        "3. You get a cited answer\n"
-        "4. Sources are listed at the bottom\n\n"
-        "Powered by <b>Contextual AI</b> 🤖",
+        "3. You get a cited text answer\n"
+        "4. A voice MP3 is sent in your chosen language\n\n"
+        "Powered by <b>Contextual AI</b> + <b>gTTS</b> 🤖🔊",
         parse_mode=ParseMode.HTML,
     )
+
+
+async def language_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show inline keyboard to pick TTS language."""
+    chat_id = update.effective_chat.id
+    current = user_prefs.get(chat_id, {}).get("lang", "en")
+
+    # Build 2-column keyboard
+    buttons = []
+    items = list(INDIAN_LANGUAGES.items())
+    for i in range(0, len(items), 2):
+        row = []
+        for code, name in items[i:i+2]:
+            label = f"✅ {name}" if code == current else name
+            row.append(InlineKeyboardButton(label, callback_data=f"lang:{code}"))
+        buttons.append(row)
+
+    await update.message.reply_text(
+        "🔊 <b>Choose your voice language</b>\n"
+        "Audio will be sent after every answer in the selected language.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def language_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle language selection from inline keyboard."""
+    query = update.callback_query
+    await query.answer()
+    chat_id = query.message.chat_id
+    lang_code = query.data.split(":")[1]
+    lang_name = INDIAN_LANGUAGES.get(lang_code, lang_code)
+
+    user_prefs.setdefault(chat_id, {})["lang"] = lang_code
+
+    # Rebuild keyboard with updated checkmark
+    buttons = []
+    items = list(INDIAN_LANGUAGES.items())
+    for i in range(0, len(items), 2):
+        row = []
+        for code, name in items[i:i+2]:
+            label = f"✅ {name}" if code == lang_code else name
+            row.append(InlineKeyboardButton(label, callback_data=f"lang:{code}"))
+        buttons.append(row)
+
+    await query.edit_message_text(
+        f"🔊 <b>Choose your voice language</b>\n"
+        f"Audio will be sent after every answer in the selected language.\n\n"
+        f"✅ Now set to: <b>{lang_name}</b>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+def generate_voice(text: str, lang: str) -> io.BytesIO:
+    """Convert plain text to MP3 bytes using gTTS."""
+    # Strip HTML tags for clean TTS input
+    clean = re.sub(r"<[^>]+>", "", text)
+    clean = re.sub(r"\[(\d+)\]", "", clean)   # remove citation markers
+    clean = clean.strip()
+    tts = gTTS(text=clean, lang=lang, slow=False)
+    buf = io.BytesIO()
+    tts.write_to_fp(buf)
+    buf.seek(0)
+    buf.name = "answer.mp3"
+    return buf
+
 
 
 async def sources_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -218,14 +307,14 @@ async def sources_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Core handler: query Contextual AI → format → reply."""
+    """Core handler: query Contextual AI → format → reply → voice."""
     question = update.message.text.strip()
     if not question:
         return
 
+    chat_id = update.effective_chat.id
     logger.info(f"Query from {update.effective_user.id}: {question!r}")
 
-    # Show "Searching..." indicator immediately
     status_msg = await update.message.reply_text(
         "🔍 <i>Searching documents…</i>",
         parse_mode=ParseMode.HTML,
@@ -233,20 +322,36 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     try:
         await update.message.chat.send_action(ChatAction.TYPING)
-
-        # Call Contextual AI
         await status_msg.edit_text(
             "⚙️ <i>Generating answer…</i>",
             parse_mode=ParseMode.HTML,
         )
         data = query_contextual_agent(question)
 
-        # Format and send
         reply = format_response(data)
         await status_msg.delete()
 
         for chunk in split_message(reply):
             await update.message.reply_text(chunk, parse_mode=ParseMode.HTML)
+
+        # ── TTS: send voice MP3 ──────────────────────────────────────────────
+        lang = user_prefs.get(chat_id, {}).get("lang", "en")
+        try:
+            await update.message.chat.send_action(ChatAction.UPLOAD_VOICE)
+            voice_buf = generate_voice(reply, lang)
+            lang_name = INDIAN_LANGUAGES.get(lang, lang)
+            await update.message.reply_audio(
+                audio=voice_buf,
+                filename="answer.mp3",
+                title=f"Answer ({lang_name})",
+                performer="Climate AI",
+            )
+        except Exception as tts_err:
+            logger.warning(f"TTS failed (non-fatal): {tts_err}")
+            await update.message.reply_text(
+                f"🔇 <i>Voice generation failed: {escape_html(str(tts_err))}</i>",
+                parse_mode=ParseMode.HTML,
+            )
 
     except requests.HTTPError as e:
         logger.error(f"Contextual AI API error: {e}")
@@ -277,6 +382,8 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("sources", sources_command))
+    app.add_handler(CommandHandler("language", language_command))
+    app.add_handler(CallbackQueryHandler(language_callback, pattern=r"^lang:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     logger.info("Bot is running (polling)…")
